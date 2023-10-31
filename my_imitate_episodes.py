@@ -1,3 +1,6 @@
+from asyncio import Condition
+from re import S
+from sre_constants import SUCCESS
 import torch
 import numpy as np
 import os
@@ -5,49 +8,67 @@ import pickle
 import argparse
 import matplotlib.pyplot as plt
 from copy import deepcopy
-from tqdm import tqdm
+from tqdm import std, tqdm
 from einops import rearrange
 
-from constants import DT
-from constants import PUPPET_GRIPPER_JOINT_OPEN
 from utils import load_data # data functions
-from utils import sample_box_pose, sample_insertion_pose # robot functions
+from my_utils import my_load_data # dataset
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
-from policy import ACTPolicy, CNNMLPPolicy
+from my_policy import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
 
-from sim_env import BOX_POSE
+from my_sim_env import CustomEnv
+from typing import List, Dict, Tuple, Any
+import json
+import test
+from tqdm import tqdm
+import scipy.stats as stats
 
 import IPython
 e = IPython.embed
 
+# DATA_FOLDER: str = "random_start_pos"
+
+# if os.name == 'nt':
+#     DATASET_DIR: str = 'C:/Research/Transformers/SingleDemoACT/data_local' + DATA_FOLDER
+# else:
+#     DATASET_DIR:str = '/home/aigeorge/research/SingleDemoACT/data_local/' + DATA_FOLDER
+# NUM_EPISODES: int = 50
+# EPISODE_LEN: int = 50
+# CAMERA_NAMES: List[str] = ['top']#, 'front', 'side-left']
+# IS_SIM: bool = True
+
+SUCCESS_CONDITIONED: bool = False
+
 def main(args):
     set_seed(1)
+    print('gpu node', args['gpu'], type(args['gpu']))
+    if args['gpu'] is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args['gpu'])
     # command line parameters
     is_eval = args['eval']
-    ckpt_dir = args['ckpt_dir']
+    save_dir = args['save_dir']
     policy_class = args['policy_class']
     onscreen_render = args['onscreen_render']
-    task_name = args['task_name']
     batch_size_train = args['batch_size']
     batch_size_val = args['batch_size']
     num_epochs = args['num_epochs']
 
-    # get task parameters
-    is_sim = task_name[:4] == 'sim_'
-    if is_sim:
-        from constants import SIM_TASK_CONFIGS
-        task_config = SIM_TASK_CONFIGS[task_name]
-    else:
-        from aloha_scripts.constants import TASK_CONFIGS
-        task_config = TASK_CONFIGS[task_name]
-    dataset_dir = task_config['dataset_dir']
-    num_episodes = task_config['num_episodes']
-    episode_len = task_config['episode_len']
-    camera_names = task_config['camera_names']
+    ckpt_dir: str = os.path.join(save_dir, 'checkpoints')
+    dataset_dir: str = os.path.join(save_dir, 'data')
+
+    # read the meta_data folder:
+    with open(os.path.join(save_dir, 'meta_data.json'), 'r') as f:
+        meta_data: Dict[str, Any] = json.load(f)
+    task_name: str = meta_data['task_name']
+    num_episodes: int = meta_data['num_episodes']
+    episode_len: int = meta_data['episode_length']
+    camera_names: List[str] = meta_data['camera_names']
+    is_sim: bool = meta_data['is_sim']
+    
 
     # fixed parameters
-    state_dim = 14
+    state_dim = 4
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -65,6 +86,8 @@ def main(args):
                          'dec_layers': dec_layers,
                          'nheads': nheads,
                          'camera_names': camera_names,
+                         'state_dim': state_dim,
+                         'SUCCESS_CONDITIONED': SUCCESS_CONDITIONED,
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -77,6 +100,7 @@ def main(args):
         'ckpt_dir': ckpt_dir,
         'episode_len': episode_len,
         'state_dim': state_dim,
+        'SUCCESS_CONDITIONED': SUCCESS_CONDITIONED,
         'lr': args['lr'],
         'policy_class': policy_class,
         'onscreen_render': onscreen_render,
@@ -85,7 +109,9 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim,
+        'transparent_arm': meta_data['transparent_arm'],
+        'include_failures': meta_data['include_failures'],
     }
 
     if is_eval:
@@ -100,7 +126,11 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
+    # load dataset
+    if SUCCESS_CONDITIONED:
+        train_dataloader, val_dataloader, stats, is_sim= my_load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
+    else:
+        train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -138,14 +168,22 @@ def make_optimizer(policy_class, policy):
     return optimizer
 
 
-def get_image(ts, camera_names):
+def get_image(obs, camera_names):
     curr_images = []
     for cam_name in camera_names:
-        curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
+        curr_image = rearrange(obs['images'][cam_name], 'h w c -> c h w')
         curr_images.append(curr_image)
     curr_image = np.stack(curr_images, axis=0)
     curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
     return curr_image
+
+
+def weighted_std(values:torch.Tensor, k):
+    weights = np.exp(-k * np.arange(len(values)))
+    weights = weights / weights.sum()
+    weights = torch.from_numpy(weights).cuda().unsqueeze(dim=1)
+    diffs = values - values.mean(dim=0, keepdim=True)
+    return (diffs.pow(2) * weights).sum(dim=0).sqrt()
 
 
 def eval_bc(config, ckpt_name, save_episode=True):
@@ -160,7 +198,13 @@ def eval_bc(config, ckpt_name, save_episode=True):
     max_timesteps = config['episode_len']
     task_name = config['task_name']
     temporal_agg = config['temporal_agg']
+    transparent_arm = config['transparent_arm']
     onscreen_cam = 'angle'
+    stop_on_success = False
+
+    if onscreen_render:
+        import cv2
+        cv2.namedWindow("plots", cv2.WINDOW_NORMAL)
 
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
@@ -174,45 +218,34 @@ def eval_bc(config, ckpt_name, save_episode=True):
     with open(stats_path, 'rb') as f:
         stats = pickle.load(f)
 
+    # print(stats)
+
     pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
     post_process = lambda a: a * stats['action_std'] + stats['action_mean']
 
     # load environment
-    if real_robot:
-        from aloha_scripts.robot_utils import move_grippers # requires aloha
-        from aloha_scripts.real_env import make_real_env # requires aloha
-        env = make_real_env(init_node=True)
-        env_max_reward = 0
-    else:
-        from sim_env import make_sim_env
-        env = make_sim_env(task_name)
-        env_max_reward = env.task.max_reward
+    env = CustomEnv(task_name, inject_noise=False, camera_names=camera_names, onscreen_render=onscreen_render, K_POS=20, transparent_arm=transparent_arm)
+    env_max_reward = env.MAX_REWARD
+    dt = env.DT
+
+    print("temporal_agg:", temporal_agg)
 
     query_frequency = policy_config['num_queries']
+    print('query_frequency', query_frequency)
     if temporal_agg:
         query_frequency = 1
         num_queries = policy_config['num_queries']
 
-    max_timesteps = int(max_timesteps * 1) # may increase for real-world tasks
+    max_timesteps = int(max_timesteps * 2) # may increase for real-world tasks
 
     num_rollouts = 50
     episode_returns = []
     highest_rewards = []
-    for rollout_id in range(num_rollouts):
+    for rollout_id in tqdm(range(num_rollouts)):
+        print(f'Rollout {rollout_id}')
         rollout_id += 0
         ### set task
-        if 'sim_transfer_cube' in task_name:
-            BOX_POSE[0] = sample_box_pose() # used in sim reset
-        elif 'sim_insertion' in task_name:
-            BOX_POSE[0] = np.concatenate(sample_insertion_pose()) # used in sim reset
-
-        ts = env.reset()
-
-        ### onscreen render
-        if onscreen_render:
-            ax = plt.subplot()
-            plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
-            plt.ion()
+        obs = env.reset()
 
         ### evaluation loop
         if temporal_agg:
@@ -224,43 +257,142 @@ def eval_bc(config, ckpt_name, save_episode=True):
         target_qpos_list = []
         rewards = []
         with torch.inference_mode():
+            last_t_for_agg = 0
+            reset_agg = False
             for t in range(max_timesteps):
-                ### update onscreen render and wait for DT
-                if onscreen_render:
-                    image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
-                    plt_img.set_data(image)
-                    plt.pause(DT)
 
                 ### process previous timestep to get qpos and image_list
-                obs = ts.observation
                 if 'images' in obs:
                     image_list.append(obs['images'])
                 else:
                     image_list.append({'main': obs['image']})
-                qpos_numpy = np.array(obs['qpos'])
+                qpos_numpy = np.array(obs['position'])
                 qpos = pre_process(qpos_numpy)
                 qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
                 qpos_history[:, t] = qpos
-                curr_image = get_image(ts, camera_names)
+                curr_image = get_image(obs, camera_names)
 
                 ### query policy
                 if config['policy_class'] == "ACT":
                     if t % query_frequency == 0:
-                        all_actions = policy(qpos, curr_image)
+                        # If we are including failures (ie, conditioning it based on success), then we need to pass the success condition to the policy as part of the qpos.
+                        # We assume that success is 1 (we want to generate succesful trajectories), and then concat
+                        if SUCCESS_CONDITIONED:
+                            # print('qpos', qpos.shape, qpos)
+                            all_actions = policy(qpos, curr_image, is_success=torch.tensor([1]).float().to(qpos.device))
+                        else:
+                            all_actions = policy(qpos, curr_image)
+                            # print('forward')
+
+                    # Original
+                    # if temporal_agg:
+                    #     all_time_actions[[t], t:t+num_queries] = all_actions
+                    #     actions_for_curr_step = all_time_actions[:, t]
+                    #     actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
+                    #     actions_for_curr_step = actions_for_curr_step[actions_populated]
+                    #     k = 0.1
+                    #     exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
+                    #     exp_weights = exp_weights / exp_weights.sum()
+                    #     exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+                    #     raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
+                    # else:
+                    #     raw_action = all_actions[:, t % query_frequency]
+
+                    # Just K
+                    # if temporal_agg:
+                    #     # print('doing just k')
+                    #     all_time_actions[[t], t:t+num_queries] = all_actions
+                    #     actions_for_curr_step = all_time_actions[:, t]
+                    #     actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
+                    #     actions_for_curr_step = deepcopy(actions_for_curr_step[actions_populated])
+                    #     if len(actions_for_curr_step) > 5:
+                    #         # print(actions_for_curr_step)
+                    #         std_adjust = torch.std(actions_for_curr_step, axis = 0)
+                    #         # std_adjust = weighted_std(actions_for_curr_step, 0.1)
+                    #         std_move = float(torch.max(std_adjust[:3]).cpu())
+                    #         std_grip = float(std_adjust[3].cpu())
+                    #         k_move = std_move/4
+                    #         k_grip = std_grip/4
+                    #         # print('K_move:', k_move, '\tK_grip', k_grip, '\tstd:', std_adjust)
+                    #     else:
+                    #         k_move = 0.1
+                    #         k_grip = 0.1
+                            
+
+                    #     exp_weights_grip = np.exp(-k_grip * np.arange(len(actions_for_curr_step)))
+                    #     exp_weights_grip = exp_weights_grip / exp_weights_grip.sum()
+                    #     exp_weights_grip = torch.from_numpy(exp_weights_grip).cuda().unsqueeze(dim=1)
+
+                    #     exp_weights_move = np.exp(-k_move * np.arange(len(actions_for_curr_step)))
+                    #     exp_weights_move = exp_weights_move / exp_weights_move.sum()
+                    #     exp_weights_move = torch.from_numpy(exp_weights_move).cuda().unsqueeze(dim=1)
+
+                    #     raw_action = torch.empty(4).cuda()
+                    #     raw_action[:3] = (actions_for_curr_step[:, :3] * exp_weights_move).sum(dim=0, keepdim=True)
+                    #     raw_action[3] = (actions_for_curr_step[:, 3:] * exp_weights_grip).sum(dim=0, keepdim=True)
+                        
+                    # else:
+                    #     raw_action = all_actions[:, t % query_frequency]
+                    
+                    # K and reset
                     if temporal_agg:
+                        # print('k and reset')
                         all_time_actions[[t], t:t+num_queries] = all_actions
-                        actions_for_curr_step = all_time_actions[:, t]
+                        actions_for_curr_step = all_time_actions[last_t_for_agg:, t]
                         actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
-                        actions_for_curr_step = actions_for_curr_step[actions_populated]
-                        k = 0.01
-                        exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
-                        exp_weights = exp_weights / exp_weights.sum()
-                        exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
-                        raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
+                        actions_for_curr_step = deepcopy(actions_for_curr_step[actions_populated])
+                        if len(actions_for_curr_step) > 5 and not reset_agg:
+                            # print(actions_for_curr_step)
+                            std_adjust = torch.std(actions_for_curr_step, axis = 0)
+                            # std_adjust = weighted_std(actions_for_curr_step, 0.1)
+                            std_move = float(torch.max(std_adjust[:3]).cpu())
+                            std_grip = float(std_adjust[3].cpu())
+                            k_move = std_move
+                            k_grip = std_grip
+                            # print('K_move:', k_move, '\tK_grip', k_grip, '\tstd:', std_adjust)
+                            if k_move > 0.5:
+                                last_t_for_agg = t
+                                reset_agg = True
+                                reset_traj = all_actions
+                                reset_t = t
+                                # print('reset_traj', reset_traj)
+                        else:
+                            k_move = 0.1
+                            k_grip = 0.1
+                            
+                        if reset_agg:
+                            actions_for_curr_step = reset_traj[:, t-reset_t, :]
+                            if t-reset_t > 25/2:
+                                reset_agg = False
+                            # print('reset action', actions_for_curr_step)
+
+
+                        exp_weights_grip = np.exp(-k_grip * np.arange(len(actions_for_curr_step)))
+                        exp_weights_grip = exp_weights_grip / exp_weights_grip.sum()
+                        exp_weights_grip = torch.from_numpy(exp_weights_grip).cuda().unsqueeze(dim=1)
+
+                        exp_weights_move = np.exp(-k_move * np.arange(len(actions_for_curr_step)))
+                        exp_weights_move = exp_weights_move / exp_weights_move.sum()
+                        exp_weights_move = torch.from_numpy(exp_weights_move).cuda().unsqueeze(dim=1)
+
+                        raw_action = torch.empty(4).cuda()
+                        raw_action[:3] = (actions_for_curr_step[:, :3] * exp_weights_move).sum(dim=0, keepdim=True)
+                        raw_action[3] = (actions_for_curr_step[:, 3:] * exp_weights_grip).sum(dim=0, keepdim=True)
+
+                        # k = 0.1
+                        # exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
+                        # exp_weights = exp_weights / exp_weights.sum()
+                        # exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+                        # raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
+                        # print(k)
+                        
                     else:
                         raw_action = all_actions[:, t % query_frequency]
                 elif config['policy_class'] == "CNNMLP":
-                    raw_action = policy(qpos, curr_image)
+                    if SUCCESS_CONDITIONED:
+                        raw_action = policy(qpos, curr_image, is_success=torch.tensor([1]).float().to(qpos.device))
+                    else:
+                        raw_action = policy(qpos, curr_image)
                 else:
                     raise NotImplementedError
 
@@ -270,17 +402,23 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 target_qpos = action
 
                 ### step the environment
-                ts = env.step(target_qpos)
+                # print('target', target_qpos)
+                target_pose = env.unnormalize_grip(target_qpos)
+                if False:
+                    test.plot_action(env.env_dict["achieved_goal"][0:3], target_pose)
+                    plt.savefig('temp.png')
+                    cv2.imshow('plots',cv2.imread('temp.png'))
+                obs = env.step_normalized_grip(target_qpos)
+                # print('acheived', obs['position'])
 
                 ### for visualization
                 qpos_list.append(qpos_numpy)
                 target_qpos_list.append(target_qpos)
-                rewards.append(ts.reward)
+                rewards.append(obs['reward'])
+                if obs['reward'] == env_max_reward and stop_on_success:
+                    break
 
             plt.close()
-        if real_robot:
-            move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)  # open
-            pass
 
         rewards = np.array(rewards)
         episode_return = np.sum(rewards[rewards!=None])
@@ -290,7 +428,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
         print(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
 
         if save_episode:
-            save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video{rollout_id}.mp4'))
+            save_videos(image_list, dt, video_path=os.path.join(ckpt_dir, f'video{rollout_id}.mp4'))
 
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)
@@ -314,9 +452,14 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 
 def forward_pass(data, policy):
-    image_data, qpos_data, action_data, is_pad = data
-    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
-    return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
+    if SUCCESS_CONDITIONED:
+        image_data, qpos_data, action_data, is_pad, is_success = data
+        image_data, qpos_data, action_data, is_pad, is_success = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda(), is_success.cuda()
+        return policy(qpos_data, image_data, action_data, is_pad, is_success = is_success)
+    else:
+        image_data, qpos_data, action_data, is_pad = data
+        image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
+        return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -379,7 +522,7 @@ def train_bc(train_dataloader, val_dataloader, config):
 
         if epoch % 100 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
-            torch.save(policy.state_dict(), ckpt_path)
+            # torch.save(policy.state_dict(), ckpt_path)
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
     ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
@@ -392,6 +535,12 @@ def train_bc(train_dataloader, val_dataloader, config):
 
     # save training curves
     plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
+
+    # save history:
+    with open(os.path.join(ckpt_dir, 'train_history.pkl'), 'wb') as f:
+        pickle.dump(train_history, f)
+    with open(os.path.join(ckpt_dir, 'validation_history.pkl'), 'wb') as f:
+        pickle.dump(validation_history, f)
 
     return best_ckpt_info
 
@@ -414,12 +563,12 @@ def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
 
 
 if __name__ == '__main__':
+    ### NOTE: Any changes to the parser must also be done in detr/main.py
     parser = argparse.ArgumentParser()
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--onscreen_render', action='store_true')
-    parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=True)
+    parser.add_argument('--save_dir', action='store', type=str, help='Directory where the checkpoint director will be created, where the recoreded sim episodes are saved, and where the meta-data JSON is located', required=True)
     parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
-    parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
     parser.add_argument('--batch_size', action='store', type=int, help='batch_size', required=True)
     parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
     parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
@@ -431,5 +580,8 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+    
+    # For chosing gpu
+    parser.add_argument('--gpu', action='store', type=int, help='chose which gpu to use', required=False)
     
     main(vars(parser.parse_args()))

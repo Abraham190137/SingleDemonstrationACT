@@ -1,0 +1,13 @@
+76% - k = max(std)/2
+78% - k_grip = std, k_move = max(std)
+84%, 80%, 84 - ^, but erase if k_move > 0.75
+86% - add in chuck if trip, cutoff = 0.5, steps = 10
+76% - ^ cutoff = 0.75
+82% - k_grip = std, k_move = max(std), erase if k_move > 0.75, new std
+78% - add in chuck if trip, cutoff = 0.5, steps = 10, new std
+88% - add in chuck if trip, cutoff = 0.5, steps = 10 -> start std after 5 steps.
+
+15- 88, 84, 80, 82 = 84
+20 - 88, 88, 88, 80 = 86
+24 - 84, 82, 90, 76 = 83
+13 - 80,  86, 92, 82 = 84

@@ -1,0 +1,1 @@
+48-50: Pick and place action for moving an object across the table (start and stop on table top)

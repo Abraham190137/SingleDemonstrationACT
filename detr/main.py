@@ -52,18 +52,20 @@ def get_args_parser():
     parser.add_argument('--masks', action='store_true',
                         help="Train segmentation head if the flag is provided")
 
-    # repeat args in imitate_episodes just to avoid error. Will not be used
+    # repeat args in imitate_episodes just to avoid error. Will not be used. ## EDITED TO REFLECT CHANGES TO imitate_episodes.py
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--onscreen_render', action='store_true')
-    parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=True)
+    # parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=True)
+    parser.add_argument('--save_dir', action='store', type=str, help='Directory where the checkpoint director will be created, where the recoreded sim episodes are saved, and where the meta-data JSON is located', required=True)
     parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
-    parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
+    # parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
     parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
     parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
     parser.add_argument('--chunk_size', action='store', type=int, help='chunk_size', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
-
+    parser.add_argument('--gpu', action='store', type=int, help='chose which gpu to use', required=False)
+    
     return parser
 
 
